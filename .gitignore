@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables (contains API keys — never commit this)
+.env
+
+# ChromaDB (auto-generated, no need to commit)
+knowledge_base/chroma_db/
+
+# Model weights (too large, host separately)
+models/best.pt
+
+# Colab/Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Zip files
+*.zip

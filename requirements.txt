@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+ultralytics==8.4.71
+pillow
+groq
+langchain
+langchain-community
+langchain-huggingface
+chromadb
+sentence-transformers
+pypdf
+requests
+pydantic
+langchain-text-splitters
+langchain-chroma
