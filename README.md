@@ -259,7 +259,7 @@ Fine-tuned YOLOv8n-cls on Google Colab (Tesla T4 GPU) for 60 epochs with AdamW o
 ![Training Results](assets/results.png)
 
 ### Confusion Matrix
-![Confusion Matrix](assets/confusion_matrix_normalized.png)
+![Confusion Matrix](assets/confusion matrix normalized.png)
 
 ### Backend Development
 Built FastAPI backend with 5 endpoints covering disease detection, weather integration, RAG-powered recommendations, and a unified advisor pipeline.
