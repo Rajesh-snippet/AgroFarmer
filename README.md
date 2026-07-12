@@ -87,6 +87,14 @@ Farmer Input (Leaf Image + Location + Language)
 | Disease Classes | 10 |
 
 ---
+## Model Training Results
+
+### Training Curves
+![Training Results](assets/results.png)
+
+### Confusion Matrix
+![Confusion Matrix](assets/confusion_matrix_normalized.png)
+![Confusion Matrix](assets/confusion_matrix.png)
 
 ## Tech Stack
 
@@ -252,15 +260,6 @@ Collected 15,023 rice disease images across 10 classes. Dataset annotated and sp
 
 ### Model Training
 Fine-tuned YOLOv8n-cls on Google Colab (Tesla T4 GPU) for 60 epochs with AdamW optimizer, cosine LR decay, and label smoothing. Achieved 99.4% test accuracy.
-
-## Model Training Results
-
-### Training Curves
-![Training Results](assets/results.png)
-
-### Confusion Matrix
-![Confusion Matrix](assets/confusion_matrix_normalized.png)
-![Confusion Matrix](assets/confusion_matrix.png)
 
 ### Backend Development
 Built FastAPI backend with 5 endpoints covering disease detection, weather integration, RAG-powered recommendations, and a unified advisor pipeline.
