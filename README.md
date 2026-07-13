@@ -285,7 +285,7 @@ Collected 9 authoritative PDFs from ICAR, IRRI, and FAO covering all supported r
 **Rajesh Sarma Bordoloi**
 AI Engineer | GenAI | FastAPI | Computer Vision
 
-[GitHub](https://github.com/rajesh-snippet) · [LinkedIn](#)
+[GitHub](https://github.com/rajesh-snippet) · [LinkedIn](https://www.linkedin.com/in/rajesh-sarma-bordoloi-272209351/?lipi=urn%3Ali%3Apage%3Ad_flagship3_profile_view_base_contact_details%3Bhv%2FuFrPVQ2m7DOCbt9BxJw%3D%3D)
 
 ---
 
