@@ -241,7 +241,9 @@ Based on the above documents, provide a structured recommendation covering:
 5. Fertilizer advice if relevant
 
 Keep advice practical and suitable for small-scale rice farmers.
-Do not make up information not present in the retrieved documents.
+Prioritize information from the retrieved documents. If the documents lack specific 
+treatment details, supplement with your general agricultural knowledge but clearly 
+indicate when doing so.
 {language_instruction}"""
 
     try:
