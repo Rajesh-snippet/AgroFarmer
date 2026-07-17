@@ -256,7 +256,7 @@ print(response.json())
 ## Development Journey
 
 ### Dataset Preparation
-Collected 15,023 rice disease images across 10 classes. Dataset annotated and split using Roboflow (70% train / 20% val / 10% test).
+Collected 15,023 rice disease images across 10 classes from Internet and Kaggle. Dataset annotated and split using Roboflow (70% train / 20% val / 10% test).
 
 ### Model Training
 Fine-tuned YOLOv8n-cls on Google Colab (Tesla T4 GPU) for 60 epochs with AdamW optimizer, cosine LR decay, and label smoothing. Achieved 99.4% test accuracy.
