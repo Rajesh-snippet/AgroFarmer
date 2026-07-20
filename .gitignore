@@ -13,7 +13,7 @@ __pycache__/
 knowledge_base/chroma_db/
 
 # Model weights (too large, host separately)
-models/best.pt
+
 
 # Colab/Jupyter checkpoints
 .ipynb_checkpoints/
