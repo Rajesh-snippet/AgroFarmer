@@ -16,3 +16,4 @@ pydantic
 langchain-text-splitters
 langchain-chroma
 streamlit
+opencv-python-headless
