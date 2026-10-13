@@ -45,7 +45,7 @@ Farmer Input (Leaf Image + Location + Language)
  │ ChromaDB RAG → Relevant │
  │ Doc Chunks │
  │ │
- │ Groq Llama 3.3-70B │
+ │ openai/gpt-oss-120b │
  │ ↓ │
  │ Structured Recommendation │
  └───────────────────────────────┘
@@ -102,7 +102,7 @@ Farmer Input (Leaf Image + Location + Language)
 |-------|-----------|
 | Disease Detection | YOLOv8n-cls (Ultralytics) |
 | Backend API | FastAPI + Uvicorn |
-| LLM | Groq Llama 3.3-70B |
+| LLM |openai/gpt-oss-120b |
 | Vector Database | ChromaDB |
 | Embeddings | sentence-transformers (all-MiniLM-L6-v2) |
 | Document Loading | LangChain + PyPDF |
