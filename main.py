@@ -6,29 +6,46 @@ Endpoints:
   GET  /weather
   POST /recommend
   POST /advisor  (full pipeline)
+
+Memory note: torch/YOLO and the RAG stack (sentence-transformers + ChromaDB)
+are imported and loaded on first use, not at import/startup, so the server
+opens its port quickly and /health stays cheap. Set PRELOAD_MODELS=1 on a
+host with plenty of RAM (e.g. Hugging Face Spaces) to warm everything at boot.
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from ultralytics import YOLO
-from PIL import Image
-from groq import Groq
-from dotenv import load_dotenv
-import requests
-import os
 import io
-from rag_service import retrieve, get_vectorstore
+import os
+import threading
 
-# ── Load environment variables ───────────────────────────────────────────────
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from groq import Groq
+from PIL import Image
+from pydantic import BaseModel
+
+# ── Environment ──────────────────────────────────────────────────────────────
 load_dotenv()
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+PRELOAD_MODELS = os.getenv("PRELOAD_MODELS", "0") == "1"
 
 if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not found in .env")
+    raise RuntimeError("GROQ_API_KEY not set (use .env locally or a host secret)")
 if not OPENWEATHER_API_KEY:
-    raise RuntimeError("OPENWEATHER_API_KEY not found in .env")
+    raise RuntimeError("OPENWEATHER_API_KEY not set (use .env locally or a host secret)")
+
+MODEL_PATH = "models/best.pt"
+
+# ── Low-confidence guard (see notes: this is a threshold, not real OOD detection)
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.70"))
+LOW_CONFIDENCE_MESSAGE = (
+    "The image could not be classified with enough confidence. Please upload a "
+    "clear, well-lit, close-up photo of a single rice leaf and try again."
+)
 
 # ── App setup ────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -39,35 +56,67 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # restrict in production
+    allow_origins=["*"],  # restrict in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    print("Loading ChromaDB vectorstore...")
-    get_vectorstore()
-    print("✅ RAG vectorstore ready")
-
-
-# ── Load YOLOv8 model once at startup ────────────────────────────────────────
-MODEL_PATH = "models/best.pt"
-try:
-    model = YOLO(MODEL_PATH)
-    print(f"✅ Model loaded from {MODEL_PATH}")
-    print(f"   Classes: {list(model.names.values())}")
-except Exception as e:
-    raise RuntimeError(f"Failed to load model from {MODEL_PATH}: {e}")
-
-# ── Groq client ──────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ── Pydantic schemas ─────────────────────────────────────────────────────────
+
+# ── Lazy loaders ─────────────────────────────────────────────────────────────
+_model = None
+_model_lock = threading.Lock()
+
+
+def get_model():
+    """Load the YOLO classifier on first use (imports torch lazily too)."""
+    global _model
+    if _model is None:
+        with _model_lock:
+            if _model is None:
+                if not os.path.exists(MODEL_PATH):
+                    raise RuntimeError(f"Model file not found: {MODEL_PATH}")
+                # A real best.pt is ~3 MB; a Git LFS pointer file is ~130 bytes.
+                if os.path.getsize(MODEL_PATH) < 100_000:
+                    raise RuntimeError(
+                        f"{MODEL_PATH} looks like a Git LFS pointer, not the real "
+                        "weights. Make sure the host pulls LFS files."
+                    )
+                from ultralytics import YOLO
+
+                _model = YOLO(MODEL_PATH)
+                print(f"Model loaded from {MODEL_PATH}")
+                print(f"Classes: {list(_model.names.values())}")
+    return _model
+
+
+def _retrieve(query: str, k: int = 4):
+    """Import the RAG stack on first use."""
+    from rag_service import retrieve
+
+    return retrieve(query, k=k)
+
+
+@app.on_event("startup")
+async def startup_event():
+    if PRELOAD_MODELS:
+        print("PRELOAD_MODELS=1: warming model and vectorstore...")
+        get_model()
+        from rag_service import get_vectorstore
+
+        get_vectorstore()
+        print("Preload complete")
+    else:
+        print("Lazy mode: model and vectorstore load on first request")
+
+
+# ── Schemas ──────────────────────────────────────────────────────────────────
 class RecommendRequest(BaseModel):
     disease: str
     confidence: float
-    language: str = "english"   # "english" | "hindi" | "assamese"
+    language: str = "english"  # "english" | "hindi" | "assamese"
+
 
 class AdvisorRequest(BaseModel):
     language: str = "english"
@@ -76,105 +125,30 @@ class AdvisorRequest(BaseModel):
     lon: float | None = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. HEALTH CHECK
-# ─────────────────────────────────────────────────────────────────────────────
-@app.get("/health")
-def health_check():
-    return {
-        "status": "ok",
-        "model": MODEL_PATH,
-        "classes": list(model.names.values()),
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. DISEASE DETECTION
-# ─────────────────────────────────────────────────────────────────────────────
-@app.post("/detect-disease")
-async def detect_disease(file: UploadFile = File(...)):
-    # Validate file type
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-
-    # Read and open image
-    try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not process uploaded image")
-
-    # Run inference
-    results = model.predict(image, verbose=False)
-    result  = results[0]
-
-    top1_idx  = result.probs.top1
+# ── Shared helpers ───────────────────────────────────────────────────────────
+def _predict(image: Image.Image) -> tuple[str, float, list[dict]]:
+    """Run the classifier. Returns (disease, top1_confidence, top5)."""
+    model = get_model()
+    result = model.predict(image, verbose=False)[0]
+    top1_idx = result.probs.top1
     top1_conf = float(result.probs.top1conf)
-    disease   = model.names[top1_idx]
-
-    # Top-5 predictions
     top5 = [
         {"disease": model.names[idx], "confidence": round(float(conf), 4)}
         for idx, conf in zip(result.probs.top5, result.probs.top5conf.tolist())
     ]
-
-    return {
-        "disease":    disease,
-        "confidence": round(top1_conf, 4),
-        "is_healthy": disease.lower() == "healthy",
-        "top5":       top5,
-    }
+    return model.names[top1_idx], top1_conf, top5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. WEATHER
-# Supports both city name and lat/lon coordinates
-# ─────────────────────────────────────────────────────────────────────────────
-@app.get("/weather")
-def get_weather(
-    city: str | None = Query(default=None, description="City name e.g. Tezpur"),
-    lat:  float | None = Query(default=None, description="Latitude e.g. 26.63"),
-    lon:  float | None = Query(default=None, description="Longitude e.g. 92.80"),
-):
-    if not city and (lat is None or lon is None):
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either 'city' or both 'lat' and 'lon'",
-        )
-
-    base_url = "https://api.openweathermap.org/data/2.5/weather"
-
-    if city:
-        params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"}
-    else:
-        params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric"}
-
+async def _read_image(file: UploadFile) -> Image.Image:
     try:
-        response = requests.get(base_url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.HTTPError:
-        raise HTTPException(status_code=404, detail="Location not found. Check city name or coordinates.")
-    except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=503, detail="Could not reach weather service.")
-
-    weather = {
-        "location":    data["name"],
-        "temperature": data["main"]["temp"],        # °C
-        "humidity":    data["main"]["humidity"],    # %
-        "description": data["weather"][0]["description"],
-        "wind_speed":  data["wind"]["speed"],       # m/s
-        "rainfall_1h": data.get("rain", {}).get("1h", 0.0),  # mm, 0 if no rain
-    }
-
-    # Simple farming advisory flags derived from weather
-    weather["advisory"] = _weather_advisory(weather)
-
-    return weather
+        image_bytes = await file.read()
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not process uploaded image")
 
 
 def _weather_advisory(w: dict) -> list[str]:
-    """Rule-based weather advisory flags fed into the LLM prompt later."""
+    """Rule-based weather advisory flags fed into the LLM prompt."""
     tips = []
     if w["rainfall_1h"] > 2.0:
         tips.append("Heavy rainfall detected — avoid pesticide spraying.")
@@ -189,46 +163,82 @@ def _weather_advisory(w: dict) -> list[str]:
     return tips
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. LLM RECOMMENDATION  (disease + weather context → Groq Llama 3.3-70B)
-# ─────────────────────────────────────────────────────────────────────────────
-@app.post("/recommend")
-def recommend(req: RecommendRequest, city: str | None = None):
-    # Weather context (same as before)
-    weather_context = ""
-    if city:
-        try:
-            w = get_weather(city=city)
-            weather_context = (
-                f"Current weather in {w['location']}: "
-                f"{w['temperature']}°C, humidity {w['humidity']}%, "
-                f"rainfall {w['rainfall_1h']}mm/hr. "
-                f"Advisory: {'; '.join(w['advisory'])}"
-            )
-        except Exception:
-            weather_context = "Weather data unavailable."
+def fetch_weather(city: str | None, lat: float | None, lon: float | None) -> dict:
+    """Plain function (no FastAPI Query defaults) so it is safe to call directly."""
+    if not city and (lat is None or lon is None):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'city' or both 'lat' and 'lon'",
+        )
 
-    # RAG retrieval — get relevant chunks from knowledge base
-    rag_query = f"How to treat and manage {req.disease} in rice?"
-    rag_results = retrieve(rag_query, k=4)
-    rag_context = "\n\n".join([
-        f"[Source: {r['source']}]\n{r['content']}"
-        for r in rag_results
-    ])
+    base_url = "https://api.openweathermap.org/data/2.5/weather"
+    if city:
+        params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"}
+    else:
+        params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY, "units": "metric"}
+
+    try:
+        response = requests.get(base_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.HTTPError:
+        raise HTTPException(
+            status_code=404, detail="Location not found. Check city name or coordinates."
+        )
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=503, detail="Could not reach weather service.")
+
+    weather = {
+        "location": data["name"],
+        "temperature": data["main"]["temp"],
+        "humidity": data["main"]["humidity"],
+        "description": data["weather"][0]["description"],
+        "wind_speed": data["wind"]["speed"],
+        "rainfall_1h": data.get("rain", {}).get("1h", 0.0),
+    }
+    weather["advisory"] = _weather_advisory(weather)
+    return weather
+
+
+def _weather_context(w: dict | None) -> str:
+    if not w:
+        return ""
+    return (
+        f"Current weather in {w['location']}: "
+        f"{w['temperature']}°C, humidity {w['humidity']}%, "
+        f"rainfall {w['rainfall_1h']}mm/hr. "
+        f"Advisory: {'; '.join(w['advisory'])}"
+    )
+
+
+def generate_recommendation(
+    disease: str, confidence: float, language: str, weather: dict | None
+) -> tuple[str, list[str]]:
+    """RAG retrieval + Groq call. Returns (recommendation_text, rag_sources)."""
+    rag_results = _retrieve(f"How to treat and manage {disease} in rice?", k=4)
+    rag_context = "\n\n".join(
+        f"[Source: {r['source']}]\n{r['content']}" for r in rag_results
+    )
 
     language_instruction = {
-        "english":  "Respond in English.",
-        "hindi":    "Respond in Hindi (Devanagari script).",
-        "assamese": "Respond in Assamese language (অসমীয়া). This is Assamese, NOT Bengali. Use Assamese vocabulary and grammar, not Bengali. For example, use 'কৰক' not 'করুন', 'হয়' not 'হয়', 'আপোনাৰ' not 'আপনার'.",
-    }.get(req.language.lower(), "Respond in English.")
+        "english": "Respond in English.",
+        "hindi": "Respond in Hindi (Devanagari script).",
+        "assamese": (
+            "Respond in Assamese language (অসমীয়া). This is Assamese, NOT Bengali. "
+            "Use Assamese vocabulary and grammar, not Bengali. For example, use "
+            "'কৰক' not 'করুন', 'হয়' not 'হয়', 'আপোনাৰ' not 'আপনার'."
+        ),
+    }.get(language.lower(), "Respond in English.")
 
-    # Updated prompt now includes RAG context
+    weather_context = _weather_context(weather)
+    weather_line = f"Weather Context: {weather_context}" if weather_context else ""
+
     prompt = f"""You are an expert agricultural advisor specializing in rice crop diseases.
 Use the retrieved knowledge base documents below to give accurate, grounded recommendations.
 
-Disease Detected: {req.disease}
-Confidence: {req.confidence * 100:.1f}%
-{f"Weather Context: {weather_context}" if weather_context else ""}
+Disease Detected: {disease}
+Confidence: {confidence * 100:.1f}%
+{weather_line}
 
 Retrieved Knowledge Base Documents:
 {rag_context}
@@ -241,77 +251,146 @@ Based on the above documents, provide a structured recommendation covering:
 5. Fertilizer advice if relevant
 
 Keep advice practical and suitable for small-scale rice farmers.
-Prioritize information from the retrieved documents. If the documents lack specific 
-treatment details, supplement with your general agricultural knowledge but clearly 
+Prioritize information from the retrieved documents. If the documents lack specific
+treatment details, supplement with your general agricultural knowledge but clearly
 indicate when doing so.
 {language_instruction}"""
 
     try:
         response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1024,
         )
-        recommendation = response.choices[0].message.content
+        text = response.choices[0].message.content
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"LLM service error: {e}")
 
+    return text, [r["source"] for r in rag_results]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. HEALTH CHECK  (cheap: does not load the model)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health_check():
     return {
-        "disease":        req.disease,
-        "confidence":     req.confidence,
-        "language":       req.language,
-        "rag_sources":    [r["source"] for r in rag_results],
-        "recommendation": recommendation,
+        "status": "ok",
+        "model": MODEL_PATH,
+        "model_loaded": _model is not None,
+        "classes": list(_model.names.values()) if _model is not None else None,
     }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. FULL ADVISOR PIPELINE
-#    Image + location + language → disease detection + weather + LLM advice
+# 2. DISEASE DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
-@app.post("/advisor")
-async def advisor(
-    file:     UploadFile = File(...),
-    language: str        = Query(default="english"),
-    city:     str | None = Query(default=None),
-    lat:      float | None = Query(default=None),
-    lon:      float | None = Query(default=None),
+@app.post("/detect-disease")
+async def detect_disease(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    image = await _read_image(file)
+    disease, conf, top5 = await run_in_threadpool(_predict, image)
+
+    return {
+        "disease": disease,
+        "confidence": round(conf, 4),
+        "is_healthy": disease.lower() == "healthy",
+        "low_confidence": conf < MIN_CONFIDENCE,
+        "top5": top5,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. WEATHER
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/weather")
+def get_weather(
+    city: str | None = Query(default=None, description="City name e.g. Tezpur"),
+    lat: float | None = Query(default=None, description="Latitude e.g. 26.63"),
+    lon: float | None = Query(default=None, description="Longitude e.g. 92.80"),
 ):
-    # Step 1 — Disease detection
-    try:
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not process uploaded image")
+    return fetch_weather(city, lat, lon)
 
-    results   = model.predict(image, verbose=False)
-    result    = results[0]
-    top1_idx  = result.probs.top1
-    top1_conf = float(result.probs.top1conf)
-    disease   = model.names[top1_idx]
 
-    # Step 2 — Weather (optional, doesn't fail the whole request)
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. LLM RECOMMENDATION
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/recommend")
+def recommend(req: RecommendRequest, city: str | None = None):
     weather = None
-    if city or (lat is not None and lon is not None):
+    if city:
         try:
-            weather = get_weather(city=city, lat=lat, lon=lon)
+            weather = fetch_weather(city, None, None)
         except Exception:
             weather = None
 
-    # Step 3 — LLM recommendation
-    rec_req = RecommendRequest(
-        disease=disease,
-        confidence=top1_conf,
-        language=language,
+    text, sources = generate_recommendation(
+        req.disease, req.confidence, req.language, weather
     )
-    recommendation_response = recommend(rec_req, city=city)
+    return {
+        "disease": req.disease,
+        "confidence": req.confidence,
+        "language": req.language,
+        "rag_sources": sources,
+        "recommendation": text,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. FULL ADVISOR PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/advisor")
+async def advisor(
+    file: UploadFile = File(...),
+    language: str = Query(default="english"),
+    city: str | None = Query(default=None),
+    lat: float | None = Query(default=None),
+    lon: float | None = Query(default=None),
+):
+    # Step 1: disease detection
+    image = await _read_image(file)
+    disease, conf, _ = await run_in_threadpool(_predict, image)
+
+    detection = {
+        "disease": disease,
+        "confidence": round(conf, 4),
+        "is_healthy": disease.lower() == "healthy",
+    }
+
+    # Step 2: weather (optional; fetched once, reused for the LLM context)
+    weather = None
+    if city or (lat is not None and lon is not None):
+        try:
+            weather = await run_in_threadpool(fetch_weather, city, lat, lon)
+        except Exception:
+            weather = None
+
+    # ── LOW-CONFIDENCE GUARD (drop this block if you don't want it yet) ──────
+    # Returns a plain message in the same response shape, so the frontend
+    # does not need to change. No LLM call is made.
+    if conf < MIN_CONFIDENCE:
+        detection["low_confidence"] = True
+        return {
+            "detection": detection,
+            "weather": weather,
+            "recommendation": LOW_CONFIDENCE_MESSAGE,
+            "rag_sources": [],
+            "language": language,
+        }
+    # ── END GUARD ────────────────────────────────────────────────────────────
+
+    # Step 3: LLM recommendation with RAG
+    text, sources = await run_in_threadpool(
+        generate_recommendation, disease, conf, language, weather
+    )
 
     return {
-        "detection": {
-            "disease":    disease,
-            "confidence": round(top1_conf, 4),
-            "is_healthy": disease.lower() == "healthy",
-        },
-        "weather":        weather,
-        "recommendation": recommendation_response["recommendation"],
-        "language":       language,
+        "detection": detection,
+        "weather": weather,
+        "recommendation": text,
+        "rag_sources": sources,
+        "language": language,
     }
