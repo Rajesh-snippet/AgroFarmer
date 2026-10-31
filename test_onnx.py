@@ -7,10 +7,10 @@ image_path = r"C:\Users\rsarm\OneDrive\Desktop\Project AgroFarmer\test_images\Di
 
 # Load both models
 print("Loading original model...")
-pt_model = YOLO("models/best.pt")
+pt_model = YOLO("models/best.pt", task="classify")
 
 print("Loading ONNX model...")
-onnx_model = YOLO("models/best.onnx")
+onnx_model = YOLO("models/best.onnx", task="classify")
 
 # Run prediction using original model
 print("\nOriginal PyTorch prediction:")
