@@ -728,7 +728,7 @@ Farmer Input  →  Image + Location + Language
           |             |             |
           └─────────────┼─────────────┘
                         |
-              Groq Llama 3.3-70B
+              Groq openai/gpt-oss-120b
                         |
              Structured Recommendation
         """, language=None)
@@ -759,7 +759,7 @@ Farmer Input  →  Image + Location + Language
         st.markdown("<div class='section-label'>Tech Stack</div>", unsafe_allow_html=True)
         stack = {
             "Detection": "YOLOv8n-cls (Ultralytics)",
-            "LLM": "Groq Llama 3.3-70B",
+            "LLM": "Groq openai/gpt-oss-120b",
             "Vector DB": "ChromaDB",
             "Embeddings": "sentence-transformers",
             "Backend": "FastAPI + Uvicorn",
