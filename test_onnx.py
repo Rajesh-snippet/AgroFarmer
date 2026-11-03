@@ -3,7 +3,7 @@ from ultralytics import YOLO
 from pathlib import Path
 
 # Test image
-image_path = r"C:\Users\rsarm\OneDrive\Desktop\Project AgroFarmer\test_images\Diease unknown.jpg"
+image_path = r"C:\Users\rsarm\OneDrive\Desktop\Project AgroFarmer\test_images\Disease unknown.jpg"
 
 # Load both models
 print("Loading original model...")
