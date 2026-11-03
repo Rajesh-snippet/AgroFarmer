@@ -24,3 +24,5 @@ Thumbs.db
 
 # Zip files
 *.zip
+test_images/
+main_backup.py
