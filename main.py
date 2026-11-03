@@ -7,10 +7,9 @@ Endpoints:
   POST /recommend
   POST /advisor  (full pipeline)
 
-Memory note: torch/YOLO and the RAG stack (sentence-transformers + ChromaDB)
-are imported and loaded on first use, not at import/startup, so the server
-opens its port quickly and /health stays cheap. Set PRELOAD_MODELS=1 on a
-host with plenty of RAM (e.g. Hugging Face Spaces) to warm everything at boot.
+Memory note: ONNX Runtime and the RAG stack (sentence-transformers + ChromaDB)
+are loaded on first use, not at import/startup, so the server opens quickly and
+/health stays cheap. Set PRELOAD_MODELS=1 only on a host with enough RAM.
 """
 
 import io
@@ -23,7 +22,8 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
-from PIL import Image
+from PIL import Image, ImageOps
+import numpy as np
 from pydantic import BaseModel
 
 # ── Environment ──────────────────────────────────────────────────────────────
@@ -38,7 +38,20 @@ if not GROQ_API_KEY:
 if not OPENWEATHER_API_KEY:
     raise RuntimeError("OPENWEATHER_API_KEY not set (use .env locally or a host secret)")
 
-MODEL_PATH = "models/best.pt"
+MODEL_PATH = "models/best.onnx"
+IMAGE_SIZE = 224
+CLASS_NAMES = [
+    "bacterial_leaf_blight",
+    "brown_spot",
+    "healthy",
+    "leaf_blast",
+    "leaf_scald",
+    "narrow_brown_spot",
+    "neck_blast",
+    "rice_hispa",
+    "sheath_blight",
+    "tungro",
+]
 
 # ── Low-confidence guard (see notes: this is a threshold, not real OOD detection)
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.70"))
@@ -64,32 +77,45 @@ app.add_middleware(
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 
-# ── Lazy loaders ─────────────────────────────────────────────────────────────
-_model = None
+# ── Lazy ONNX Runtime loader ──────────────────────────────────────────────────
+_session = None
 _model_lock = threading.Lock()
 
 
 def get_model():
-    """Load the YOLO classifier on first use (imports torch lazily too)."""
-    global _model
-    if _model is None:
+    """Load the ONNX model on first use without importing PyTorch/Ultralytics."""
+    global _session
+    if _session is None:
         with _model_lock:
-            if _model is None:
+            if _session is None:
                 if not os.path.exists(MODEL_PATH):
-                    raise RuntimeError(f"Model file not found: {MODEL_PATH}")
-                # A real best.pt is ~3 MB; a Git LFS pointer file is ~130 bytes.
+                    raise RuntimeError(f"ONNX model file not found: {MODEL_PATH}")
+                # A Git LFS pointer is tiny; the real exported ONNX model is several MB.
                 if os.path.getsize(MODEL_PATH) < 100_000:
                     raise RuntimeError(
-                        f"{MODEL_PATH} looks like a Git LFS pointer, not the real "
-                        "weights. Make sure the host pulls LFS files."
+                        f"{MODEL_PATH} looks like a Git LFS pointer, not the real model. "
+                        "Make sure the host pulls Git LFS files."
                     )
-                from ultralytics import YOLO
 
-                _model = YOLO(MODEL_PATH)
-                print(f"Model loaded from {MODEL_PATH}")
-                print(f"Classes: {list(_model.names.values())}")
-    return _model
+                import onnxruntime as ort
 
+                options = ort.SessionOptions()
+                options.intra_op_num_threads = 1
+                options.inter_op_num_threads = 1
+                options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                # Reduce retained CPU memory on small hosting instances.
+                options.enable_cpu_mem_arena = False
+                options.enable_mem_pattern = False
+
+                _session = ort.InferenceSession(
+                    MODEL_PATH,
+                    sess_options=options,
+                    providers=["CPUExecutionProvider"],
+                )
+                print(f"ONNX model loaded from {MODEL_PATH}")
+                print(f"Classes: {CLASS_NAMES}")
+                print(f"ONNX input: {_session.get_inputs()[0].shape}")
+    return _session
 
 def _retrieve(query: str, k: int = 4):
     """Import the RAG stack on first use."""
@@ -101,7 +127,7 @@ def _retrieve(query: str, k: int = 4):
 @app.on_event("startup")
 async def startup_event():
     if PRELOAD_MODELS:
-        print("PRELOAD_MODELS=1: warming model and vectorstore...")
+        print("PRELOAD_MODELS=1: warming ONNX model and vectorstore...")
         get_model()
         from rag_service import get_vectorstore
 
@@ -127,16 +153,43 @@ class AdvisorRequest(BaseModel):
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
 def _predict(image: Image.Image) -> tuple[str, float, list[dict]]:
-    """Run the classifier. Returns (disease, top1_confidence, top5)."""
-    model = get_model()
-    result = model.predict(image, verbose=False)[0]
-    top1_idx = result.probs.top1
-    top1_conf = float(result.probs.top1conf)
+    """Run ONNX classification. Returns (disease, top1_confidence, top5)."""
+    session = get_model()
+
+    # Match Ultralytics classification inference: resize while preserving aspect
+    # ratio, center-crop to 224x224, convert RGB to float32 in the 0..1 range.
+    image = ImageOps.fit(
+        image.convert("RGB"),
+        (IMAGE_SIZE, IMAGE_SIZE),
+        method=Image.Resampling.BILINEAR,
+        centering=(0.5, 0.5),
+    )
+    input_array = np.asarray(image, dtype=np.float32) / 255.0
+    input_array = np.transpose(input_array, (2, 0, 1))[None, ...]
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: input_array})
+    scores = np.asarray(outputs[0]).reshape(-1).astype(np.float32)
+
+    if scores.size != len(CLASS_NAMES):
+        raise RuntimeError(
+            f"Unexpected ONNX output size: {scores.size}; expected {len(CLASS_NAMES)} classes"
+        )
+
+    # Ultralytics classification exports commonly include softmax in the graph.
+    # Keep probabilities as-is when already normalized; otherwise apply softmax.
+    if not (np.all(scores >= 0.0) and np.all(scores <= 1.0) and np.isclose(scores.sum(), 1.0, atol=1e-3)):
+        scores = scores - np.max(scores)
+        exp_scores = np.exp(scores)
+        scores = exp_scores / exp_scores.sum()
+
+    order = np.argsort(scores)[::-1]
+    top1_idx = int(order[0])
+    top1_conf = float(scores[top1_idx])
     top5 = [
-        {"disease": model.names[idx], "confidence": round(float(conf), 4)}
-        for idx, conf in zip(result.probs.top5, result.probs.top5conf.tolist())
+        {"disease": CLASS_NAMES[int(idx)], "confidence": round(float(scores[idx]), 4)}
+        for idx in order[:5]
     ]
-    return model.names[top1_idx], top1_conf, top5
+    return CLASS_NAMES[top1_idx], top1_conf, top5
 
 
 async def _read_image(file: UploadFile) -> Image.Image:
@@ -278,8 +331,8 @@ def health_check():
     return {
         "status": "ok",
         "model": MODEL_PATH,
-        "model_loaded": _model is not None,
-        "classes": list(_model.names.values()) if _model is not None else None,
+        "model_loaded": _session is not None,
+        "classes": CLASS_NAMES,
     }
 
 
